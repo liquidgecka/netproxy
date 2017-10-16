@@ -30,4 +30,4 @@ script:
 - test "$FMT_AND_VET" != 1 || go test -v -race .
 after_script:
 - test "$FMT_AND_VET" != 1 || $HOME/gopath/bin/goveralls -coverprofile=/tmp/coverage.out
-  -service=travis-ci -repotoken $COVERALLS_TOKEN
+  -service=travis-ci -repotoken=$COVERALLS_TOKEN
