@@ -102,7 +102,7 @@ func TestProxyListener_goAcceptRoutine(t *testing.T) {
 
 	// We want to make sure it has time to process.
 	startTime := time.Now()
-	for pl.listener.(*ListenerMock).AcceptIndex != 1 {
+	for pl.listener.(*ListenerMock).acceptIndex() != 1 {
 		if time.Now().Sub(startTime) > time.Second {
 			t.Fatalf("goAcceptRoutine() took too long accepting connections.")
 		}

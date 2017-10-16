@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -30,7 +31,7 @@ type ProxyListener struct {
 	acceptChan       chan net.Conn
 	errorChan        chan error
 	listener         net.Listener
-	stop             bool
+	stop             int32
 	waitGroup        sync.WaitGroup
 }
 
@@ -68,7 +69,7 @@ func (p *ProxyListener) protocolErrorLog(
 // off into goroutine handlers.
 func (p *ProxyListener) goAcceptRoutine() {
 	defer p.waitGroup.Done()
-	for !p.stop {
+	for atomic.LoadInt32(&p.stop) == 0 {
 		conn, err := p.listener.Accept()
 		if err != nil {
 			p.errorChan <- err
@@ -466,14 +467,14 @@ func (p *ProxyListener) Close() error {
 	// turn will write an error to the error channel which will stop any
 	// callers in Accept().
 	err := p.listener.Close()
-	p.stop = true
+	atomic.StoreInt32(&p.stop, 1)
 	return err
 }
 
 // Ensures that all goroutines associated with this listener are shutdown and
 // closed out.
 func (p *ProxyListener) Stop() {
-	p.stop = true
+	atomic.StoreInt32(&p.stop, 1)
 	p.listener.Close()
 	for range p.errorChan {
 	}

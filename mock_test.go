@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 )
 
@@ -22,9 +23,18 @@ type ListenerMock struct {
 	RawAddr       net.Addr
 	CloseError    error
 	Closed        bool
+	sync.Mutex
+}
+
+func (l *ListenerMock) acceptIndex() int {
+	l.Lock()
+	defer l.Unlock()
+	return l.AcceptIndex
 }
 
 func (l *ListenerMock) Accept() (net.Conn, error) {
+	l.Lock()
+	defer l.Unlock()
 	addr := l.RawAddr
 	if addr == nil {
 		addr = &net.IPAddr{IP: net.IP([]byte{1, 2, 3, 4}), Zone: ""}
@@ -48,11 +58,15 @@ func (l *ListenerMock) Accept() (net.Conn, error) {
 }
 
 func (l *ListenerMock) Close() error {
+	l.Lock()
+	defer l.Unlock()
 	l.Closed = true
 	return l.CloseError
 }
 
 func (l *ListenerMock) Addr() net.Addr {
+	l.Lock()
+	defer l.Unlock()
 	if l.RawAddr == nil {
 		return &net.IPAddr{IP: net.IP([]byte{1, 2, 3, 4}), Zone: ""}
 	} else {
@@ -80,18 +94,25 @@ type ConnMock struct {
 	ReadDeadline    time.Time
 	DeadlineErrors  []error
 	DeadlineCounter int
+	sync.Mutex
 }
 
 func (c *ConnMock) Close() error {
+	c.Lock()
+	defer c.Unlock()
 	c.IsClosed = true
 	return nil
 }
 
 func (c *ConnMock) LocalAddr() net.Addr {
+	c.Lock()
+	defer c.Unlock()
 	return c.RawLocalAddr
 }
 
 func (c *ConnMock) Read(b []byte) (int, error) {
+	c.Lock()
+	defer c.Unlock()
 	if c.ReadIndex >= len(c.ReadReplies) {
 		return 0, io.EOF
 	}
@@ -106,14 +127,20 @@ func (c *ConnMock) Read(b []byte) (int, error) {
 }
 
 func (c *ConnMock) RemoteAddr() net.Addr {
+	c.Lock()
+	defer c.Unlock()
 	return c.RawRemoteAddr
 }
 
 func (c *ConnMock) Write(b []byte) (int, error) {
+	c.Lock()
+	defer c.Unlock()
 	return c.OutputBuffer.Write(b)
 }
 
 func (c *ConnMock) SetDeadline(t time.Time) error {
+	c.Lock()
+	defer c.Unlock()
 	if c.DeadlineErrors != nil && len(c.DeadlineErrors) > 0 {
 		err := c.DeadlineErrors[0]
 		if len(c.DeadlineErrors) == 1 {
@@ -128,10 +155,14 @@ func (c *ConnMock) SetDeadline(t time.Time) error {
 }
 
 func (c *ConnMock) SetReadDeadline(t time.Time) error {
+	c.Lock()
+	defer c.Unlock()
 	return c.SetDeadline(t)
 }
 
 func (c *ConnMock) SetWriteDeadline(t time.Time) error {
+	c.Lock()
+	defer c.Unlock()
 	return c.SetDeadline(t)
 }
 
@@ -139,6 +170,7 @@ func (c *ConnMock) SetWriteDeadline(t time.Time) error {
 type AddrMock struct {
 	network string
 	str     string
+	sync.Mutex
 }
 
 func (a *AddrMock) Network() string {
