@@ -41,11 +41,10 @@ func (l *ListenerMock) Accept() (net.Conn, error) {
 	}
 	if l.AcceptIndex >= len(l.AcceptReplies) {
 		return nil, &net.OpError{
-			Op:     "The socket is closed.",
-			Net:    addr.Network(),
-			Source: nil,
-			Addr:   addr,
-			Err:    fmt.Errorf("The socket is closed."),
+			Op:   "The socket is closed.",
+			Net:  addr.Network(),
+			Addr: addr,
+			Err:  fmt.Errorf("The socket is closed."),
 		}
 	}
 	if w := l.AcceptReplies[l.AcceptIndex].NotBefore.Sub(time.Now()); w > 0 {
