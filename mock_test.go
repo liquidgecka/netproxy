@@ -71,17 +71,19 @@ type readResponse struct {
 // mock out all sorts of calls so we can simulate various connection
 // states.
 type ConnMock struct {
-	ReadReplies   []readResponse
-	ReadIndex     int
-	OutputBuffer  *bufio.Writer
-	IsClosed      bool
-	RawLocalAddr  net.Addr
-	RawRemoteAddr net.Addr
-	ReadDeadline  time.Time
-	DeadlineError error
+	ReadReplies     []readResponse
+	ReadIndex       int
+	OutputBuffer    *bufio.Writer
+	IsClosed        bool
+	RawLocalAddr    net.Addr
+	RawRemoteAddr   net.Addr
+	ReadDeadline    time.Time
+	DeadlineErrors  []error
+	DeadlineCounter int
 }
 
 func (c *ConnMock) Close() error {
+	c.IsClosed = true
 	return nil
 }
 
@@ -112,24 +114,52 @@ func (c *ConnMock) Write(b []byte) (int, error) {
 }
 
 func (c *ConnMock) SetDeadline(t time.Time) error {
-	if c.DeadlineError != nil {
-		return c.DeadlineError
+	if c.DeadlineErrors != nil && len(c.DeadlineErrors) > 0 {
+		err := c.DeadlineErrors[0]
+		if len(c.DeadlineErrors) == 1 {
+			c.DeadlineErrors = nil
+		} else {
+			c.DeadlineErrors = c.DeadlineErrors[1:]
+		}
+		return err
 	}
 	c.ReadDeadline = t
 	return nil
 }
 
 func (c *ConnMock) SetReadDeadline(t time.Time) error {
-	if c.DeadlineError != nil {
-		return c.DeadlineError
-	}
-	c.ReadDeadline = t
-	return nil
+	return c.SetDeadline(t)
 }
 
 func (c *ConnMock) SetWriteDeadline(t time.Time) error {
-	if c.DeadlineError != nil {
-		return c.DeadlineError
+	return c.SetDeadline(t)
+}
+
+// Mocks out net.Addr
+type AddrMock struct {
+	network string
+	str     string
+}
+
+func (a *AddrMock) Network() string {
+	return a.network
+}
+
+func (a *AddrMock) String() string {
+	return a.str
+}
+
+// A simple helper that takes a byte array and makes it into a readReplies
+// array for the ListenerMock.
+func makeReplies(b []byte, raw ...[]byte) []readResponse {
+	rr := make([]readResponse, 0, len(b)+2+len(raw))
+	rr = append(rr, readResponse{Data: []byte("P")})
+	rr = append(rr, readResponse{Data: []byte("ROXY ")})
+	for _, data := range b {
+		rr = append(rr, readResponse{Data: []byte{data}})
 	}
-	return nil
+	for _, data := range raw {
+		rr = append(rr, readResponse{Data: data})
+	}
+	return rr
 }
