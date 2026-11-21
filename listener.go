@@ -2,9 +2,13 @@ package netproxy
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -12,6 +16,7 @@ import (
 )
 
 const (
+	v2Version           = 0x02
 	commandLocal        = 0
 	commandProxy        = 1
 	familyUnspecified   = 0
@@ -21,475 +26,511 @@ const (
 	protocolUnspecified = 0
 	protocolStream      = 1
 	protocolDgram       = 2
+
+	maxV1LineLen      = 107
+	v1Prefix          = "PROXY "
+	v2HeaderRemainLen = 15
+	v2IPv4AddrLen     = 12
+	v2IPv6AddrLen     = 36
+	v2UnixAddrLen     = 216
+	v2UnixPathLen     = 108
+	acceptQueueSize   = 100
 )
 
-// Implements net.Listener, except this allows incoming connections to specify
-// the real source of the connection via the PROXY command.
-type ProxyListener struct {
-	ProtocolDeadline time.Duration
-	ProtocolError    func(error)
-	acceptChan       chan net.Conn
-	errorChan        chan error
-	listener         net.Listener
-	stop             int32
-	waitGroup        sync.WaitGroup
+var v2Signature = [12]byte{
+	0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
 }
 
-func Listen(network, address string) (net.Listener, error) {
+var _ net.Listener = (*ProxyListener)(nil)
+
+// Option configures a [*ProxyListener] before it starts accepting connections.
+type Option func(*ProxyListener)
+
+// WithProtocolDeadline sets the maximum time allowed to read a complete PROXY
+// header from a newly accepted connection. A zero duration disables the deadline.
+func WithProtocolDeadline(d time.Duration) Option {
+	return func(p *ProxyListener) {
+		p.ProtocolDeadline = d
+	}
+}
+
+// WithProtocolError sets the callback invoked when an incoming connection fails
+// PROXY protocol parsing or deadline setup. The callback may be invoked
+// concurrently from multiple goroutines.
+func WithProtocolError(fn func(error)) Option {
+	return func(p *ProxyListener) {
+		p.ProtocolError = fn
+	}
+}
+
+// ProxyListener implements [net.Listener], parsing incoming HAProxy PROXY
+// protocol v1 or v2 headers so accepted connections report the client's
+// proxied remote address via RemoteAddr.
+type ProxyListener struct {
+	// ProtocolDeadline limits how long a newly accepted connection has to
+	// send a complete PROXY header. Zero disables the deadline. Configure via
+	// [WithProtocolDeadline]; must not be modified after starting.
+	ProtocolDeadline time.Duration
+
+	// ProtocolError is called when an incoming connection fails PROXY
+	// protocol parsing or deadline setup before closing the connection.
+	// It may be called concurrently from multiple goroutines. Configure via
+	// [WithProtocolError]; must not be modified after starting.
+	ProtocolError func(error)
+
+	acceptChan chan net.Conn
+	errorChan  chan error
+	done       chan struct{}
+	listener   net.Listener
+	closed     atomic.Bool
+	mu         sync.Mutex
+	pending    map[net.Conn]struct{}
+	acceptWG   sync.WaitGroup
+	connWG     sync.WaitGroup
+	stopOnce   sync.Once
+}
+
+// Listen announces on the local network address and wraps the resulting
+// [net.Listener] in a [*ProxyListener].
+func Listen(network, address string, opts ...Option) (net.Listener, error) {
 	listener, err := net.Listen(network, address)
 	if err != nil {
 		return nil, err
 	}
-	return ListenWrapper(listener), nil
+	return ListenWrapper(listener, opts...), nil
 }
 
-func ListenWrapper(l net.Listener) *ProxyListener {
+// ListenWrapper wraps an existing [net.Listener] so accepted connections
+// must present a valid PROXY protocol v1 or v2 header.
+func ListenWrapper(l net.Listener, opts ...Option) *ProxyListener {
 	p := &ProxyListener{
 		listener:   l,
-		acceptChan: make(chan net.Conn, 100),
+		acceptChan: make(chan net.Conn, acceptQueueSize),
 		errorChan:  make(chan error),
+		done:       make(chan struct{}),
+		pending:    make(map[net.Conn]struct{}),
 	}
-	p.waitGroup.Add(1)
-	go p.goAcceptRoutine()
+	for _, opt := range opts {
+		if opt != nil {
+			opt(p)
+		}
+	}
+	p.acceptWG.Go(p.acceptLoop)
 	return p
 }
 
-// Internal wrapper that will log the given error if the ProtocolError function
-// is defined otherwise it does nothing.
-func (p *ProxyListener) protocolErrorLog(
-	conn net.Conn, msg string, args ...interface{},
-) {
-	if f := p.ProtocolError; f != nil {
-		f(fmt.Errorf(msg, args...))
-	}
-	conn.Close()
-}
-
-// The singleton accept routine that accepts new connections and spins them
-// off into goroutine handlers.
-func (p *ProxyListener) goAcceptRoutine() {
-	defer p.waitGroup.Done()
-	for atomic.LoadInt32(&p.stop) == 0 {
+func (p *ProxyListener) acceptLoop() {
+	for !p.closed.Load() {
 		conn, err := p.listener.Accept()
 		if err != nil {
-			p.errorChan <- err
+			if p.closed.Load() {
+				return
+			}
+			select {
+			case p.errorChan <- err:
+			case <-p.done:
+				return
+			}
 			continue
 		}
 
-		// Shard off the connection to a goroutine that will
-		// read the PROXY header.
-		p.waitGroup.Add(1)
-		go p.goReadProxyRoutine(conn)
+		p.connWG.Go(func() {
+			p.handleConn(conn)
+		})
 	}
-	close(p.errorChan)
-	close(p.acceptChan)
 }
 
-// The handler that takes a single connection and reads the PROXY line.
-func (p *ProxyListener) goReadProxyRoutine(conn net.Conn) {
-	defer p.waitGroup.Done()
+func (p *ProxyListener) handleConn(conn net.Conn) {
+	if !p.trackPending(conn) {
+		_ = conn.Close()
+		return
+	}
 
-	// We need to set the ProtocolDeadline on the connection.
+	wrapped, err := p.readProxyHeader(conn)
+	removed := p.untrackPending(conn)
+	if err != nil {
+		if removed {
+			p.reportProtocolError(conn, err)
+		} else {
+			_ = conn.Close()
+		}
+		return
+	}
+
+	if !removed || p.closed.Load() {
+		_ = wrapped.Close()
+		return
+	}
+
+	select {
+	case p.acceptChan <- wrapped:
+	case <-p.done:
+		_ = wrapped.Close()
+	}
+}
+
+func (p *ProxyListener) trackPending(conn net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed.Load() {
+		return false
+	}
+	if p.pending == nil {
+		p.pending = make(map[net.Conn]struct{})
+	}
+	p.pending[conn] = struct{}{}
+	return true
+}
+
+func (p *ProxyListener) untrackPending(conn net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.pending[conn]; !ok {
+		return false
+	}
+	delete(p.pending, conn)
+	return true
+}
+
+func (p *ProxyListener) reportProtocolError(conn net.Conn, err error) {
+	if !p.closed.Load() && p.ProtocolError != nil {
+		p.ProtocolError(err)
+	}
+	_ = conn.Close()
+}
+
+func (p *ProxyListener) readProxyHeader(conn net.Conn) (net.Conn, error) {
 	if p.ProtocolDeadline != 0 {
-		deadline := time.Now().Add(p.ProtocolDeadline)
-		if err := conn.SetDeadline(deadline); err != nil {
-			p.protocolErrorLog(conn, "Error setting deadline on the socket: %s",
-				err)
-			return
+		if err := conn.SetDeadline(time.Now().Add(p.ProtocolDeadline)); err != nil {
+			return nil, fmt.Errorf("setting protocol deadline: %w", err)
 		}
 	}
 
-	// Only read 1 byte so we can establish which protocol we are reading.
-	fb := make([]byte, 1)
-	if n, err := conn.Read(fb); err == io.EOF {
-		p.protocolErrorLog(conn, "Connection closed before first byte.")
-		return
-	} else if err != nil {
-		p.protocolErrorLog(conn, "Error reading first byte: %s", err)
-		return
-	} else if n != 1 {
-		p.protocolErrorLog(conn, "Invalid number of bytes read: %d", n)
-		return
+	var first [1]byte
+	if _, err := io.ReadFull(conn, first[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("connection closed before first byte")
+		}
+		return nil, fmt.Errorf("reading first byte: %w", err)
 	}
 
-	switch fb[0] {
+	var (
+		wrapped net.Conn
+		err     error
+	)
+	switch first[0] {
 	case 'P':
-		p.readVersion1(conn)
-		return
-	case 0x0D:
-		p.readBinary(conn)
-		return
+		wrapped, err = readVersion1(conn)
+	case v2Signature[0]:
+		wrapped, err = readBinary(conn)
 	default:
-		p.protocolErrorLog(conn, "Invalid first byte: %d", fb[0])
-		return
+		return nil, fmt.Errorf("invalid first byte: %d", first[0])
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	if p.ProtocolDeadline != 0 {
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			return nil, fmt.Errorf("clearing protocol deadline: %w", err)
+		}
+	}
+	return wrapped, nil
 }
 
-// This call will handle incoming Version 1 connections. Those are connections
-// that operate in plain text, and start with 'PROXY' as the first bytes
-// received off the connection.
-func (p *ProxyListener) readVersion1(conn net.Conn) {
-	// We need to do an unbuffered read since we don't want to over
-	// read and start consuming the initial HTTP connection.
-	//
-	// 107 is the maximum defined in the document:
-	// https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt
-	proxyLine := make([]byte, 107)
-	proxyLineLen := 0
+// readVersion1 parses a plain-text PROXY protocol v1 line starting after the
+// leading 'P' byte that was already read during protocol detection.
+func readVersion1(conn net.Conn) (net.Conn, error) {
+	// 107 bytes is the maximum v1 line length including CRLF defined by the
+	// HAProxy specification.
+	var proxyLine [maxV1LineLen]byte
+	proxyLine[0] = 'P'
 
-	// First we need to ensure that the text starts with the expected
-	// PROXY line. If not then we can close the session as we would have
-	// already consumed bytes which will screw up the underlying protocol
-	// for any receiver. Note that we already read the 'P' in the protocol
-	// detection component.
-	expect := []byte("ROXY ")
-	for proxyLineLen = 0; proxyLineLen < len(expect); {
-		buffer := proxyLine[proxyLineLen:len(expect)]
-		if n, err := conn.Read(buffer); err != nil {
-			if err == io.EOF {
-				p.protocolErrorLog(
-					conn, "TCP session closed prior to PROXY line.")
-			} else {
-				p.protocolErrorLog(
-					conn, "TCP error reading PROXY line: %s", err)
+	if _, err := io.ReadFull(conn, proxyLine[1:len(v1Prefix)]); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, errors.New("connection closed prior to PROXY prefix")
+		}
+		return nil, fmt.Errorf("reading PROXY prefix: %w", err)
+	}
+	if !bytes.Equal(proxyLine[:len(v1Prefix)], []byte(v1Prefix)) {
+		return nil, errors.New("header did not start with 'PROXY '")
+	}
+
+	// Read byte-by-byte to avoid consuming application payload past CRLF.
+	lineEnd := -1
+	for i := len(v1Prefix); i < len(proxyLine); i++ {
+		if _, err := io.ReadFull(conn, proxyLine[i:i+1]); err != nil {
+			return nil, fmt.Errorf("reading PROXY line: %w", err)
+		}
+		if proxyLine[i] == '\n' {
+			return nil, errors.New("malformed PROXY line: bare LF without CR")
+		}
+		if proxyLine[i] == '\r' {
+			if i+1 >= len(proxyLine) {
+				return nil, errors.New("malformed PROXY line: exceeds maximum length")
 			}
-			return
-		} else {
-			proxyLineLen += int(n)
-		}
-	}
-	if !bytes.Equal(proxyLine[0:proxyLineLen], expect) {
-		p.protocolErrorLog(
-			conn, "First line did not start with 'P"+string(expect)+"'")
-		return
-	}
-
-	// Loop through the rest of the first line from the socket.
-	for i := proxyLineLen; ; i++ {
-		if i >= len(proxyLine) {
-			p.protocolErrorLog(conn, "PROXY line malformed (too long)")
-			return
-		} else if n, err := conn.Read(proxyLine[i : i+1]); err != nil {
-			p.protocolErrorLog(conn, "Error reading PROXY line: %s", err)
-			return
-		} else if n != 1 {
-			p.protocolErrorLog(
-				conn, "Invalid number of bytes read from socket: %d", n)
-			return
-		} else if proxyLine[i] == '\r' {
+			if _, err := io.ReadFull(conn, proxyLine[i+1:i+2]); err != nil {
+				return nil, fmt.Errorf("reading PROXY line CRLF: %w", err)
+			}
+			if proxyLine[i+1] != '\n' {
+				return nil, errors.New("malformed PROXY line: CR not followed by LF")
+			}
+			lineEnd = i
 			break
-		} else {
-			proxyLineLen += n
 		}
 	}
-
-	// Validate the data from the line. We know that this will split into
-	// at least 2 spots due to the "PROXY " check above.
-	parts := bytes.Split(proxyLine[0:proxyLineLen], []byte(" "))
-	if !bytes.Equal(parts[1], []byte("UNKNOWN")) {
-		// Any other form must have 6 fields.
-		//  - PROXY
-		//  - TCP4 || TCP6
-		//  - source ip
-		//  - destination ip
-		//  - source port
-		//  - destination port
-		if len(parts) != 6 {
-			p.protocolErrorLog(
-				conn,
-				"PROXY line is malformed, incorrect number of elements: %d",
-				len(parts))
-			return
-		}
-		switch {
-		case bytes.Equal(parts[1], []byte("TCP4")):
-		case bytes.Equal(parts[1], []byte("TCP6")):
-		default:
-			p.protocolErrorLog(
-				conn, "Protocol element of the PROXY line is invalid: %s",
-				string(parts[1]))
-			return
-		}
-
-		// Parse the source port.
-		port, err := strconv.ParseInt(string(parts[4]), 10, 32)
-		if err != nil {
-			p.protocolErrorLog(
-				conn,
-				"destination port element of the PROXY line is not an int: %s",
-				err)
-			return
-		}
-		addr := &net.TCPAddr{
-			IP:   net.ParseIP(string(parts[2])),
-			Port: int(port),
-		}
-		conn = &connWrapper{Conn: conn, newRemoteAddr: addr}
+	if lineEnd < 0 {
+		return nil, errors.New("malformed PROXY line: exceeds maximum length")
 	}
 
-	// Now we disable the deadline so the connection will act as it would
-	// in a default Listen() call.
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		p.protocolErrorLog(
-			conn, "Error unsetting deadline on the socket: %s", err)
-		return
+	addr, err := parseVersion1Line(proxyLine[:lineEnd])
+	if err != nil {
+		return nil, err
 	}
-
-	// Lastly, pass conn on to the Accept caller.
-	p.acceptChan <- conn
-	return
+	if addr == nil {
+		return conn, nil
+	}
+	return &connWrapper{Conn: conn, newRemoteAddr: addr}, nil
 }
 
-// This is called when a binary protocol header is read from the wire.
-func (p *ProxyListener) readBinary(conn net.Conn) {
-	// The binary protocol actually makes it easy to read the whole
-	// network block in two passes rather than reading each individual part
-	// one step at a time.
-	//
-	// Step one is to read the header, (of which we have already read a single
-	// byte in the protocol selection stage.) This is formatted as such:
-	//   12 - Fixed header bytes.
-	//    1 - The version / command specifier.
-	//    1 - The transport protocol / family specifier.
-	//    2 - Address length in network order.
-	// Once we read this block we will need to read a block as large as was
-	// specified in the Address length field. We do this regardless of other
-	// fields as this is required in the protocol specification.
-	header := make([]byte, 11+1+1+2)
-	for i := 0; i < len(header); {
-		if n, err := conn.Read(header[i:]); err != nil {
-			p.protocolErrorLog(
-				conn, "Error reading binary header data: %s", err)
-			return
-		} else {
-			i += n
+func parseVersion1Line(line []byte) (net.Addr, error) {
+	parts := bytes.Split(line, []byte(" "))
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("malformed PROXY line: incorrect number of elements: %d", len(parts))
+	}
+	if bytes.Equal(parts[1], []byte("UNKNOWN")) {
+		return nil, nil
+	}
+	if len(parts) != 6 {
+		return nil, fmt.Errorf("malformed PROXY line: incorrect number of elements: %d", len(parts))
+	}
+
+	proto := string(parts[1])
+	if proto != "TCP4" && proto != "TCP6" {
+		return nil, fmt.Errorf("invalid PROXY protocol %q", proto)
+	}
+
+	srcIP, err := netip.ParseAddr(string(parts[2]))
+	if err != nil {
+		return nil, fmt.Errorf("invalid source IP %q: %w", string(parts[2]), err)
+	}
+	dstIP, err := netip.ParseAddr(string(parts[3]))
+	if err != nil {
+		return nil, fmt.Errorf("invalid destination IP %q: %w", string(parts[3]), err)
+	}
+
+	switch proto {
+	case "TCP4":
+		if !srcIP.Is4() || !dstIP.Is4() {
+			return nil, errors.New("protocol TCP4 requires IPv4 addresses")
+		}
+	case "TCP6":
+		if !srcIP.Is6() || srcIP.Is4In6() || srcIP.Zone() != "" ||
+			!dstIP.Is6() || dstIP.Is4In6() || dstIP.Zone() != "" {
+			return nil, errors.New("protocol TCP6 requires IPv6 addresses")
 		}
 	}
 
-	// Parse each field in the header.
-	expect := []byte{
-		0x0AD, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x10,
+	srcPort, err := strconv.ParseUint(string(parts[4]), 10, 16)
+	if err != nil {
+		return nil, fmt.Errorf("invalid source port %q: %w", string(parts[4]), err)
 	}
-	if !bytes.Equal(header[0:len(expect)], expect) {
-		p.protocolErrorLog(
-			conn, "Static header bytes did not match expected value.")
-		return
+	if _, err := strconv.ParseUint(string(parts[5]), 10, 16); err != nil {
+		return nil, fmt.Errorf("invalid destination port %q: %w", string(parts[5]), err)
 	}
 
-	// Version.
-	switch header[len(expect)] >> 4 {
-	case 0x02:
-	default:
-		p.protocolErrorLog(conn, "Version in the header was not 2: %d",
-			header[len(expect)]>>4)
-		return
+	return net.TCPAddrFromAddrPort(netip.AddrPortFrom(srcIP, uint16(srcPort))), nil
+}
+
+// readBinary parses a PROXY protocol v2 binary header starting after the
+// leading 0x0D signature byte read during protocol detection.
+func readBinary(conn net.Conn) (net.Conn, error) {
+	// Remaining fixed header after the first signature byte (0x0D):
+	//  11 - remaining signature bytes
+	//   1 - version (high 4 bits) and command (low 4 bits)
+	//   1 - address family (high 4 bits) and transport protocol (low 4 bits)
+	//   2 - big-endian payload length
+	var header [v2HeaderRemainLen]byte
+	if _, err := io.ReadFull(conn, header[:]); err != nil {
+		return nil, fmt.Errorf("reading binary header: %w", err)
 	}
 
-	// Command bits.
-	command := header[len(expect)] & 0x0F
-	switch command {
-	case commandLocal:
-	case commandProxy:
-	default:
-		p.protocolErrorLog(conn, "Command bits contained an invalid value: %d",
-			command)
-		return
+	if !bytes.Equal(header[:11], v2Signature[1:]) {
+		return nil, errors.New("binary signature mismatch")
 	}
 
-	// Family bits.
-	family := header[len(expect)+1] >> 4
+	version := header[11] >> 4
+	if version != v2Version {
+		return nil, fmt.Errorf("unsupported binary protocol version: %d", version)
+	}
+
+	command := header[11] & 0x0F
+	if command != commandLocal && command != commandProxy {
+		return nil, fmt.Errorf("invalid binary command: %d", command)
+	}
+
+	family := header[12] >> 4
+	if family > familyUnix {
+		return nil, fmt.Errorf("invalid binary address family: %d", family)
+	}
+
+	protocol := header[12] & 0x0F
+	if protocol > protocolDgram {
+		return nil, fmt.Errorf("invalid binary transport protocol: %d", protocol)
+	}
+
+	length := int(binary.BigEndian.Uint16(header[13:15]))
+	var address []byte
+	if length > 0 {
+		address = make([]byte, length)
+		if _, err := io.ReadFull(conn, address); err != nil {
+			return nil, fmt.Errorf("reading binary address payload: %w", err)
+		}
+	}
+
+	if command == commandLocal || family == familyUnspecified || protocol == protocolUnspecified {
+		return conn, nil
+	}
+
+	addr, err := parseBinaryAddr(family, protocol, address)
+	if err != nil {
+		return nil, err
+	}
+	return &connWrapper{Conn: conn, newRemoteAddr: addr}, nil
+}
+
+func parseBinaryAddr(family, protocol byte, address []byte) (net.Addr, error) {
 	switch family {
-	case familyUnspecified:
 	case familyInet:
+		if len(address) < v2IPv4AddrLen {
+			return nil, fmt.Errorf("invalid IPv4 proxy address length: got %d, want at least %d", len(address), v2IPv4AddrLen)
+		}
+		ip := net.IPv4(address[0], address[1], address[2], address[3])
+		port := int(binary.BigEndian.Uint16(address[8:10]))
+		switch protocol {
+		case protocolStream:
+			return &net.TCPAddr{IP: ip, Port: port}, nil
+		case protocolDgram:
+			return &net.UDPAddr{IP: ip, Port: port}, nil
+		}
+
 	case familyInet6:
+		if len(address) < v2IPv6AddrLen {
+			return nil, fmt.Errorf("invalid IPv6 proxy address length: got %d, want at least %d", len(address), v2IPv6AddrLen)
+		}
+		// Clone the 16-byte slice so the rest of the payload buffer can be GC'd.
+		ip := net.IP(slices.Clone(address[0:16]))
+		port := int(binary.BigEndian.Uint16(address[32:34]))
+		switch protocol {
+		case protocolStream:
+			return &net.TCPAddr{IP: ip, Port: port}, nil
+		case protocolDgram:
+			return &net.UDPAddr{IP: ip, Port: port}, nil
+		}
+
 	case familyUnix:
-	default:
-		p.protocolErrorLog(conn, "Family bits contained an invalid value: %d",
-			family)
-		return
-	}
-
-	// Protocol bits.
-	protocol := header[len(expect)+1] & 0x0F
-	switch protocol {
-	case protocolUnspecified:
-	case protocolStream:
-	case protocolDgram:
-	default:
-		p.protocolErrorLog(conn,
-			"Protocol bits contained an invalid value: %d", protocol)
-		return
-	}
-
-	// Length is the last two bits.
-	length := int(header[len(expect)+2])<<8 + int(header[len(expect)+3])
-
-	// Sanity check on length to ensure that it is never too large.
-	if length > 208 {
-		p.protocolErrorLog(conn, "Length integer is too large to be valid: %d",
-			length)
-		return
-	}
-
-	// We need to read the bytes into a buffer..
-	address := make([]byte, length)
-	for i := 0; i < len(address); {
-		if n, err := conn.Read(address[i:]); err != nil {
-			p.protocolErrorLog(conn, "Error reading binary address data: %s",
-				err)
-			return
-		} else {
-			i += n
+		if len(address) < v2UnixAddrLen {
+			return nil, fmt.Errorf("invalid UNIX proxy address length: got %d, want at least %d", len(address), v2UnixAddrLen)
+		}
+		srcPath := address[:v2UnixPathLen]
+		if end := bytes.IndexByte(srcPath, 0); end >= 0 {
+			srcPath = srcPath[:end]
+		}
+		name := string(srcPath)
+		switch protocol {
+		case protocolStream:
+			return &net.UnixAddr{Name: name, Net: "unix"}, nil
+		case protocolDgram:
+			return &net.UnixAddr{Name: name, Net: "unixgram"}, nil
 		}
 	}
 
-	// Regardless of outcome at this point we need to unset the Deadline timer
-	// so we go ahead and do that here.
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		p.protocolErrorLog(conn, "Error unsetting deadline on the socket: %s",
-			err)
-		return
-	}
-
-	// If the command family is listed as LOCAL then we don't do any processing
-	// on it at all. We just pass the connection directly on to the Accept()
-	// function. This is typically used for health checks. We also pass through
-	// any connection with an unspecified family or protocol.
-	switch {
-	case command != commandLocal:
-	case family != familyUnspecified:
-	case protocol != protocolUnspecified:
-	default:
-		p.acceptChan <- conn
-		return
-	}
-
-	// TCP connections over IPv4
-	switch {
-	case family != familyInet:
-	case protocol != protocolStream:
-	default:
-		if len(address) != 12 {
-			p.protocolErrorLog(conn,
-				"Invalid address length for a INET proxy (should be 12): %d",
-				len(address))
-			return
-		}
-		addr := &net.TCPAddr{
-			IP:   net.IPv4(address[0], address[1], address[2], address[3]),
-			Port: int(address[8])<<8 + int(address[9]),
-		}
-		conn = &connWrapper{Conn: conn, newRemoteAddr: addr}
-		p.acceptChan <- conn
-		return
-	}
-
-	// UDP connections over IPv4
-	switch {
-	case family != familyInet:
-	case protocol != protocolDgram:
-	default:
-		if len(address) != 12 {
-			p.protocolErrorLog(conn,
-				"Invalid address length for a INET proxy (should be 12): %d",
-				len(address))
-			return
-		}
-		addr := &net.UDPAddr{
-			IP:   net.IPv4(address[0], address[1], address[2], address[3]),
-			Port: int(address[8])<<8 + int(address[9]),
-		}
-		conn = &connWrapper{Conn: conn, newRemoteAddr: addr}
-		p.acceptChan <- conn
-		return
-	}
-
-	// TCP connections over IPv6
-	switch {
-	case family != familyInet6:
-	case protocol != protocolStream && family != protocolDgram:
-	default:
-		if len(address) != 36 {
-			p.protocolErrorLog(conn,
-				"Invalid address length for a INET6 proxy (should be 36): %d",
-				len(address))
-			return
-		}
-		// We need to copy the array rather than using a slice because we don't
-		// want the whole address block persisted for the length of the
-		// connection.
-		newAddr := make([]byte, 16)
-		copy(newAddr, address[0:16])
-		addr := &net.TCPAddr{
-			IP:   net.IP(newAddr),
-			Port: int(address[32])<<8 + int(address[33]),
-		}
-		conn = &connWrapper{Conn: conn, newRemoteAddr: addr}
-		p.acceptChan <- conn
-		return
-	}
-
-	// FIXME: Add Dgram support?
-	p.protocolErrorLog(conn, "Unsupported family/protocol combination.")
-	return
+	return nil, fmt.Errorf("unsupported family/protocol combination: family=%d protocol=%d", family, protocol)
 }
 
-// Returns the address of the listening socket.
+// Addr returns the listener's network address.
 func (p *ProxyListener) Addr() net.Addr {
 	return p.listener.Addr()
 }
 
-// This will pop the next connection off the queue. This connection should
-// ideally have its Addr() set to match the address passed into us using
-// the PROXY command. If the data was unknown then the address will not
-// be touched and will hold the incoming address of the load balancer.
-//
-// This actually pops already connected sockets off a channel so that it will
-// act just like the Accept() call in net.Listener. Closing the socket will
-// cause this to return an error.
+// Accept waits for and returns the next connection to the listener after
+// parsing its PROXY header. The returned connection's RemoteAddr reflects
+// the proxied client address when provided.
 func (p *ProxyListener) Accept() (net.Conn, error) {
-	// Accept actually reads connections off the channel that were already
-	// accepted and processed by the runner goroutine.
+	if p.closed.Load() {
+		return nil, net.ErrClosed
+	}
 	select {
 	case err := <-p.errorChan:
 		return nil, err
 	case conn := <-p.acceptChan:
 		return conn, nil
+	case <-p.done:
+		return nil, net.ErrClosed
 	}
 }
 
-// Like net.Listener this will close the underlying socket. Unlike net.Listener
-// this is not sufficient to ensure that the underlying objects all get purged.
-// Since this object has a running goroutine you must call Stop() to be
-// absolutely sure that everything is closed properly.
+// Close stops accepting new connections, closes any connections currently
+// reading a PROXY header, and closes the underlying [net.Listener].
+// Unlike [ProxyListener.Stop], Close does not wait for background goroutines
+// to exit.
 func (p *ProxyListener) Close() error {
-	// We need to stop the accepting thread by closing the socket. This in
-	// turn will write an error to the error channel which will stop any
-	// callers in Accept().
-	err := p.listener.Close()
-	atomic.StoreInt32(&p.stop, 1)
-	return err
+	var toClose []net.Conn
+	p.mu.Lock()
+	if !p.closed.Swap(true) {
+		if p.done != nil {
+			close(p.done)
+		}
+		if len(p.pending) > 0 {
+			toClose = make([]net.Conn, 0, len(p.pending))
+			for c := range p.pending {
+				toClose = append(toClose, c)
+			}
+			clear(p.pending)
+		}
+	}
+	p.mu.Unlock()
+
+	for _, c := range toClose {
+		_ = c.Close()
+	}
+	if p.listener != nil {
+		return p.listener.Close()
+	}
+	return nil
 }
 
-// Ensures that all goroutines associated with this listener are shutdown and
-// closed out.
+// Stop closes the listener, waits for all background accept and header
+// parsing goroutines to finish, and closes any parsed connections still
+// waiting in the accept queue.
 func (p *ProxyListener) Stop() {
-	atomic.StoreInt32(&p.stop, 1)
-	p.listener.Close()
-	for range p.errorChan {
-	}
-	for range p.acceptChan {
-	}
-	p.waitGroup.Wait()
+	p.stopOnce.Do(func() {
+		_ = p.Close()
+		p.acceptWG.Wait()
+		p.connWG.Wait()
+		for {
+			select {
+			case conn := <-p.acceptChan:
+				_ = conn.Close()
+			default:
+				return
+			}
+		}
+	})
 }
 
-// This is a wrapper around net.TCPConn that lets us overwrite the RemoteAddr
-// function so we can return the remoteAddr provided by the PROXY line.
+// connWrapper wraps a [net.Conn] to override RemoteAddr with the address
+// parsed from a PROXY protocol header.
 type connWrapper struct {
 	net.Conn
 	newRemoteAddr net.Addr
 }
 
-func (t *connWrapper) RemoteAddr() net.Addr {
-	return t.newRemoteAddr
+func (c *connWrapper) RemoteAddr() net.Addr {
+	return c.newRemoteAddr
+}
+
+// NetConn returns the underlying [net.Conn].
+func (c *connWrapper) NetConn() net.Conn {
+	return c.Conn
 }

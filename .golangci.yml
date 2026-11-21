@@ -1,0 +1,37 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - copyloopvar
+    - errname
+    - errorlint
+    - gocritic
+    - intrange
+    - misspell
+    - modernize
+    - nilerr
+    - prealloc
+    - revive
+    - unconvert
+    - unparam
+  settings:
+    govet:
+      enable-all: true
+      disable:
+        - fieldalignment
+        - shadow
+    misspell:
+      locale: US
+  exclusions:
+    presets:
+      - common-false-positives
+      - std-error-handling
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true

@@ -1,8 +1,9 @@
 package netproxy
 
 import (
-	"bufio"
-	"fmt"
+	"bytes"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -10,13 +11,11 @@ import (
 )
 
 type acceptResponse struct {
-	Conn      net.Conn
-	Error     error
-	NotBefore time.Time
+	Conn  net.Conn
+	Error error
 }
 
-// ListenerMock is used in several places in order to allow us to mock out
-// various calls and simulate all sorts of failures for testing.
+// ListenerMock simulates a [net.Listener] for unit testing.
 type ListenerMock struct {
 	AcceptReplies []acceptResponse
 	AcceptIndex   int
@@ -26,34 +25,24 @@ type ListenerMock struct {
 	sync.Mutex
 }
 
-func (l *ListenerMock) acceptIndex() int {
-	l.Lock()
-	defer l.Unlock()
-	return l.AcceptIndex
-}
-
 func (l *ListenerMock) Accept() (net.Conn, error) {
 	l.Lock()
 	defer l.Unlock()
 	addr := l.RawAddr
 	if addr == nil {
-		addr = &net.IPAddr{IP: net.IP([]byte{1, 2, 3, 4}), Zone: ""}
+		addr = &net.IPAddr{IP: net.IP{1, 2, 3, 4}}
 	}
 	if l.AcceptIndex >= len(l.AcceptReplies) {
 		return nil, &net.OpError{
-			Op:   "The socket is closed.",
+			Op:   "accept",
 			Net:  addr.Network(),
 			Addr: addr,
-			Err:  fmt.Errorf("The socket is closed."),
+			Err:  errors.New("socket is closed"),
 		}
 	}
-	if w := l.AcceptReplies[l.AcceptIndex].NotBefore.Sub(time.Now()); w > 0 {
-		time.Sleep(w)
-	}
-	conn := l.AcceptReplies[l.AcceptIndex].Conn
-	err := l.AcceptReplies[l.AcceptIndex].Error
+	reply := l.AcceptReplies[l.AcceptIndex]
 	l.AcceptIndex++
-	return conn, err
+	return reply.Conn, reply.Error
 }
 
 func (l *ListenerMock) Close() error {
@@ -67,32 +56,26 @@ func (l *ListenerMock) Addr() net.Addr {
 	l.Lock()
 	defer l.Unlock()
 	if l.RawAddr == nil {
-		return &net.IPAddr{IP: net.IP([]byte{1, 2, 3, 4}), Zone: ""}
-	} else {
-		return l.RawAddr
+		return &net.IPAddr{IP: net.IP{1, 2, 3, 4}}
 	}
+	return l.RawAddr
 }
 
-// For tracking replies that should be sent out via read()
 type readResponse struct {
-	NotBefore time.Time
-	Data      []byte
-	Error     error
+	Data  []byte
+	Error error
 }
 
-// ConnMock is used to simulate a net.Conn for testing. It allows us to
-// mock out all sorts of calls so we can simulate various connection
-// states.
+// ConnMock simulates a [net.Conn] for unit testing.
 type ConnMock struct {
-	ReadReplies     []readResponse
-	ReadIndex       int
-	OutputBuffer    *bufio.Writer
-	IsClosed        bool
-	RawLocalAddr    net.Addr
-	RawRemoteAddr   net.Addr
-	ReadDeadline    time.Time
-	DeadlineErrors  []error
-	DeadlineCounter int
+	ReadReplies    []readResponse
+	ReadIndex      int
+	OutputBuffer   bytes.Buffer
+	IsClosed       bool
+	RawLocalAddr   net.Addr
+	RawRemoteAddr  net.Addr
+	ReadDeadline   time.Time
+	DeadlineErrors []error
 	sync.Mutex
 }
 
@@ -115,14 +98,14 @@ func (c *ConnMock) Read(b []byte) (int, error) {
 	if c.ReadIndex >= len(c.ReadReplies) {
 		return 0, io.EOF
 	}
-	if w := c.ReadReplies[c.ReadIndex].NotBefore.Sub(time.Now()); w > 0 {
-		time.Sleep(w)
+	reply := &c.ReadReplies[c.ReadIndex]
+	n := copy(b, reply.Data)
+	if n < len(reply.Data) {
+		reply.Data = reply.Data[n:]
+		return n, nil
 	}
-	copy(b, c.ReadReplies[c.ReadIndex].Data)
-	n := len(c.ReadReplies[c.ReadIndex].Data)
-	err := c.ReadReplies[c.ReadIndex].Error
 	c.ReadIndex++
-	return n, err
+	return n, reply.Error
 }
 
 func (c *ConnMock) RemoteAddr() net.Addr {
@@ -137,10 +120,8 @@ func (c *ConnMock) Write(b []byte) (int, error) {
 	return c.OutputBuffer.Write(b)
 }
 
-func (c *ConnMock) SetDeadline(t time.Time) error {
-	c.Lock()
-	defer c.Unlock()
-	if c.DeadlineErrors != nil && len(c.DeadlineErrors) > 0 {
+func (c *ConnMock) setDeadlineLocked(t time.Time) error {
+	if len(c.DeadlineErrors) > 0 {
 		err := c.DeadlineErrors[0]
 		if len(c.DeadlineErrors) == 1 {
 			c.DeadlineErrors = nil
@@ -153,23 +134,28 @@ func (c *ConnMock) SetDeadline(t time.Time) error {
 	return nil
 }
 
+func (c *ConnMock) SetDeadline(t time.Time) error {
+	c.Lock()
+	defer c.Unlock()
+	return c.setDeadlineLocked(t)
+}
+
 func (c *ConnMock) SetReadDeadline(t time.Time) error {
 	c.Lock()
 	defer c.Unlock()
-	return c.SetDeadline(t)
+	return c.setDeadlineLocked(t)
 }
 
 func (c *ConnMock) SetWriteDeadline(t time.Time) error {
 	c.Lock()
 	defer c.Unlock()
-	return c.SetDeadline(t)
+	return c.setDeadlineLocked(t)
 }
 
-// Mocks out net.Addr
+// AddrMock simulates a [net.Addr] for unit testing.
 type AddrMock struct {
 	network string
 	str     string
-	sync.Mutex
 }
 
 func (a *AddrMock) Network() string {
@@ -180,17 +166,32 @@ func (a *AddrMock) String() string {
 	return a.str
 }
 
-// A simple helper that takes a byte array and makes it into a readReplies
-// array for the ListenerMock.
-func makeReplies(b []byte, raw ...[]byte) []readResponse {
-	rr := make([]readResponse, 0, len(b)+2+len(raw))
-	rr = append(rr, readResponse{Data: []byte("P")})
-	rr = append(rr, readResponse{Data: []byte("ROXY ")})
-	for _, data := range b {
-		rr = append(rr, readResponse{Data: []byte{data}})
-	}
-	for _, data := range raw {
-		rr = append(rr, readResponse{Data: data})
+func makeRawReplies(chunks ...[]byte) []readResponse {
+	rr := make([]readResponse, 0, len(chunks))
+	for _, chunk := range chunks {
+		rr = append(rr, readResponse{Data: chunk})
 	}
 	return rr
+}
+
+func makeV1Replies(body []byte, trailing ...[]byte) []readResponse {
+	rr := make([]readResponse, 0, len(body)+2+len(trailing))
+	rr = append(rr, readResponse{Data: []byte("P")})
+	rr = append(rr, readResponse{Data: []byte("ROXY ")})
+	for _, b := range body {
+		rr = append(rr, readResponse{Data: []byte{b}})
+	}
+	for _, chunk := range trailing {
+		rr = append(rr, readResponse{Data: chunk})
+	}
+	return rr
+}
+
+func makeV2Header(verCmd, famProto byte, payloadLen uint16) []byte {
+	hdr := make([]byte, 16)
+	copy(hdr[:12], v2Signature[:])
+	hdr[12] = verCmd
+	hdr[13] = famProto
+	binary.BigEndian.PutUint16(hdr[14:16], payloadLen)
+	return hdr
 }
