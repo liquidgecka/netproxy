@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/liquidgecka/netproxy"
+	"github.com/liquidgecka/netproxy/v2"
 )
 
 // Example demonstrates basic usage of netproxy in place of a normal net.Listener.

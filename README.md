@@ -1,7 +1,7 @@
 # netproxy
 
 [![CI](https://github.com/liquidgecka/netproxy/actions/workflows/ci.yml/badge.svg)](https://github.com/liquidgecka/netproxy/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/liquidgecka/netproxy.svg)](https://pkg.go.dev/github.com/liquidgecka/netproxy)
+[![Go Reference](https://pkg.go.dev/badge/github.com/liquidgecka/netproxy/v2.svg)](https://pkg.go.dev/github.com/liquidgecka/netproxy/v2)
 
 ## Overview
 
@@ -10,7 +10,7 @@
 ## Installation
 
 ```sh
-go get github.com/liquidgecka/netproxy
+go get github.com/liquidgecka/netproxy/v2
 ```
 
 Requires Go 1.26 or later.
